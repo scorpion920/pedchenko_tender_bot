@@ -1,112 +1,128 @@
-"""
-Telegram бот для моніторингу тендерів ProZorro
-"""
+import logging
 import time
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
-
-from config import TELEGRAM_TOKEN, CHAT_ID, CHECK_INTERVAL
+from telegram.ext import Updater, CommandHandler, CallbackContext
 from tender_api import ProZorroAPI
+from config import TELEGRAM_TOKEN, CHAT_ID, CHECK_INTERVAL
+
+# Налаштування логування
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+api = ProZorroAPI()
 
 
-class TenderBot:
-    """Клас Telegram бота для моніторингу тендерів"""
-    
-    def __init__(self):
-        self.api = ProZorroAPI()
-        self.sent_tenders = set()  # Зберігаємо вже надіслані tender_id
-    
-    def start_command(self, update: Update, context: CallbackContext):
-        """Команда /start"""
-        welcome_message = (
-            "🚀 Ласкаво просимо до бота моніторингу тендерів ProZorro!\n\n"
-            "📋 Доступні команди:\n"
-            "/tenders - Знайти актуальні тендери\n"
-            "/help - Показати довідку\n\n"
-            "🤖 Бот автоматично перевіряє нові тендери кожні 10 хвилин"
-        )
-        update.message.reply_text(welcome_message)
-    
-    def help_command(self, update: Update, context: CallbackContext):
-        """Команда /help"""
-        help_message = (
-            "📖 Довідка по боту:\n\n"
-            "🔍 Фільтри пошуку:\n"
-            "• Статус: active.tendering (прийом пропозицій)\n"
-            "• Регіони: Київ, Черкаси\n"
-            "• CPV коди: будівництво та ремонт (1542xxx-1598xxx)\n\n"
-            "⚙️ Команди:\n"
-            "/tenders - Ручний пошук тендерів\n"
-            "/start - Головне меню\n\n"
-            "🔄 Автоматичні сповіщення надходять кожні 10 хвилин"
-        )
-        update.message.reply_text(help_message)
-    
-    def tenders_command(self, update: Update, context: CallbackContext):
-        """Команда /tenders - ручний пошук тендерів"""
-        try:
-            update.message.reply_text("🔄 Шукаю актуальні тендери...")
-            
-            messages = self.api.search_tenders()
-            
-            if not messages:
-                update.message.reply_text("❌ Нових тендерів за заданими фільтрами не знайдено.")
-                return
-            
-            # Відправляємо кожен тендер окремим повідомленням
-            for message in messages:
-                context.bot.send_message(
-                    chat_id=update.effective_chat.id, 
-                    text=message
-                )
-                time.sleep(0.2)  # Невелика затримка між повідомленнями
-                
-            update.message.reply_text(f"✅ Знайдено {len(messages)} тендерів!")
-            
-        except Exception as e:
-            update.message.reply_text(f"❌ Помилка: {e}")
-    
-    def periodic_check(self, context: CallbackContext):
-        """Періодична перевірка нових тендерів"""
-        try:
-            print("🔄 Виконую періодичну перевірку тендерів...")
-            
-            messages = self.api.search_tenders()
-            
-            if messages:
-                for message in messages:
-                    context.bot.send_message(chat_id=CHAT_ID, text=message)
-                    time.sleep(0.2)
-                
-                print(f"✅ Відправлено {len(messages)} нових тендерів")
-            else:
-                print("ℹ️ Нових тендерів не знайдено")
-                
-        except Exception as e:
-            print(f"❌ Помилка в періодичній перевірці: {e}")
-    
-    def run(self):
-        """Запуск бота"""
-        updater = Updater(TELEGRAM_TOKEN, use_context=True)
-        dp = updater.dispatcher
-        jq: JobQueue = updater.job_queue
+def start(update: Update, context: CallbackContext) -> None:
+    """
+    Обробник команди /start.
+    Відправляє вітальне повідомлення користувачу.
 
-        # Регистрация команд
-        dp.add_handler(CommandHandler("start", self.start_command))
-        dp.add_handler(CommandHandler("help", self.help_command))
-        dp.add_handler(CommandHandler("tenders", self.tenders_command))
+    Args:
+        update (Update): Об'єкт Telegram Update.
+        context (CallbackContext): Контекст виконання.
+    """
+    update.message.reply_text("👋 Привіт! Це бот моніторингу тендерів ProZorro.")
 
-        # Автоматическая проверка каждые 10 минут
-        jq.run_repeating(self.periodic_check, interval=CHECK_INTERVAL, first=10)
 
-        print("🤖 Бот запущено!")
-        print("📋 Доступні команди: /start, /help, /tenders")
-        print(f"⏰ Автоматична перевірка кожні {CHECK_INTERVAL//60} хвилин")
-        
-        updater.start_polling()
-        updater.idle()
+def help_command(update: Update, context: CallbackContext) -> None:
+    """
+    Обробник команди /help.
+    Пояснює доступні команди.
+
+    Args:
+        update (Update): Об'єкт Telegram Update.
+        context (CallbackContext): Контекст виконання.
+    """
+    help_text = (
+        "📖 Доступні команди:\n"
+        "/start - початок роботи\n"
+        "/help - довідка\n"
+        "/tenders - отримати список нових тендерів"
+    )
+    update.message.reply_text(help_text)
+
+
+def tenders(update: Update, context: CallbackContext) -> None:
+    """
+    Обробник команди /tenders.
+    Виконує пошук нових тендерів і надсилає користувачу.
+
+    Args:
+        update (Update): Об'єкт Telegram Update.
+        context (CallbackContext): Контекст виконання.
+    """
+    try:
+        results = api.search_tenders()
+
+        if not results:
+            update.message.reply_text("Немає нових тендерів.")
+            return
+
+        for tender in results[:5]:  # обмежимо вивід для зручності
+            message = (
+                f"📌 {tender['title']}\n"
+                f"ID: {tender['tenderID']}\n"
+                f"Статус: {tender['status']}\n"
+                f"Регіон: {tender['region']}\n"
+                f"Дата: {tender['dateModified']}\n"
+                f"https://prozorro.gov.ua/tender/{tender['id']}"
+            )
+            update.message.reply_text(message)
+
+    except Exception as e:
+        logger.error(f"Помилка у команді /tenders: {e}")
+        update.message.reply_text("⚠️ Сталася помилка при отриманні тендерів.")
+
+
+def auto_check(context: CallbackContext) -> None:
+    """
+    Функція для автоматичної перевірки нових тендерів.
+    Виконується за розкладом кожні N секунд.
+
+    Args:
+        context (CallbackContext): Контекст виконання.
+    """
+    try:
+        results = api.search_tenders()
+
+        for tender in results:
+            message = (
+                f"📌 {tender['title']}\n"
+                f"ID: {tender['tenderID']}\n"
+                f"Статус: {tender['status']}\n"
+                f"Регіон: {tender['region']}\n"
+                f"Дата: {tender['dateModified']}\n"
+                f"https://prozorro.gov.ua/tender/{tender['id']}"
+            )
+            context.bot.send_message(chat_id=CHAT_ID, text=message)
+
+    except Exception as e:
+        logger.error(f"Помилка авто-перевірки: {e}")
+
+
+def main() -> None:
+    """
+    Головна функція запуску Telegram-бота.
+    """
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dispatcher = updater.dispatcher
+
+    # Реєстрація команд
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("tenders", tenders))
+
+    # Запуск автоматичної перевірки кожні N секунд
+    job_queue = updater.job_queue
+    job_queue.run_repeating(auto_check, interval=CHECK_INTERVAL, first=10)
+
+    logger.info("🚀 Бот запущено!")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
-    bot = TenderBot()
-    bot.run()
+    main()

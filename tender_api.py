@@ -1,190 +1,142 @@
 """
-Модуль для роботи з ProZorro API
+tender_api.py — модуль для роботи з ProZorro API.
+
+Цей файл містить клас `ProZorroAPI`, який відповідає за:
+- Виконання HTTP-запитів до API ProZorro
+- Фільтрацію тендерів за CPV кодами та регіонами
+- Підготовку текстових повідомлень для Telegram бота
+- Підтримку пагінації та унікальності результатів
 """
-import requests
+
 import time
-from typing import List, Dict, Optional
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from datetime import datetime
+import logging
+import requests
+from typing import List, Dict
 
 from config import (
     BASE_URL, CPV_CODES, ALLOWED_REGIONS, ALLOWED_REGION_KEYWORDS,
     SESSION_HEADERS, PAGE_LIMIT, MAX_PAGES, REQUEST_TIMEOUT, REQUEST_DELAY
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ProZorroAPI:
-    """Клас для роботи з ProZorro API"""
-    
+    """
+    Клас для роботи з ProZorro API.
+
+    Attributes:
+        session (requests.Session): HTTP-сесія для повторного використання з'єднання
+        seen_tenders (set): множина для збереження ID вже оброблених тендерів
+    """
+
     def __init__(self):
-        self.session = self._create_session()
-    
-    def _create_session(self) -> requests.Session:
-        """Створення HTTP сесії з retry логікою"""
-        session = requests.Session()
-        retries = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        session.headers.update(SESSION_HEADERS)
-        return session
-    
-    def get_tenders(self, limit: int = PAGE_LIMIT) -> Dict:
-        """Отримання списку тендерів"""
-        try:
-            response = self.session.get(
-                BASE_URL,
-                params={"limit": limit, "descending": 1},
-                timeout=REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Помилка отримання тендерів: {e}")
-            return {}
-    
-    def get_tender_details(self, tender_id: str) -> Dict:
-        """Отримання деталей конкретного тендера"""
-        try:
-            url = f"{BASE_URL}/{tender_id}"
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            return response.json().get('data', {})
-        except requests.RequestException as e:
-            print(f"Помилка деталей тендера {tender_id}: {e}")
-            return {}
-    
-    def fetch_tenders_with_pagination(self) -> List[Dict]:
-        """Отримання тендерів з пагінацією"""
-        first_page = self.get_tenders(limit=PAGE_LIMIT)
-        if not first_page or not first_page.get('data'):
-            return []
+        self.session = requests.Session()
+        self.session.headers.update(SESSION_HEADERS)
+        self.seen_tenders = set()
 
-        next_offset = (first_page.get('next_page') or {}).get('offset')
-        tenders_pages = [first_page.get('data', [])]
+    def _is_region_allowed(self, address: str) -> bool:
+        """
+        Перевіряє, чи адреса замовника належить до дозволених регіонів.
 
-        for _ in range(MAX_PAGES - 1):
-            if not next_offset:
-                break
-            try:
-                page = self.session.get(
-                    BASE_URL,
-                    params={"limit": PAGE_LIMIT, "descending": 1, "offset": next_offset},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                page.raise_for_status()
-                page_json = page.json()
-                tenders_pages.append(page_json.get('data', []))
-                next_offset = (page_json.get('next_page') or {}).get('offset')
-            except Exception:
-                break
+        Args:
+            address (str): рядок з адресою замовника
 
-        return tenders_pages
-    
-    def filter_tenders(self, tenders_pages: List[List[Dict]]) -> List[Dict]:
-        """Фільтрація тендерів за заданими критеріями"""
+        Returns:
+            bool: True, якщо адреса відповідає фільтру; False — інакше
+        """
+        if not address:
+            return False
+        return any(region in address for region in ALLOWED_REGIONS) or \
+               any(keyword in address for keyword in ALLOWED_REGION_KEYWORDS)
+
+    def _is_cpv_allowed(self, cpv_code: str) -> bool:
+        """
+        Перевіряє, чи CPV-код належить до дозволених.
+
+        Args:
+            cpv_code (str): CPV-код (класифікатор)
+
+        Returns:
+            bool: True, якщо код відповідає фільтру; False — інакше
+        """
+        return any(cpv_code.startswith(code[:4]) for code in CPV_CODES)
+
+    def _fetch_page(self, offset: str = "") -> Dict:
+        """
+        Виконує HTTP-запит на отримання сторінки тендерів з API.
+
+        Args:
+            offset (str): курсор пагінації (по замовчуванню — порожній)
+
+        Returns:
+            dict: JSON-відповідь від API
+
+        Raises:
+            requests.RequestException: у випадку проблем з мережею
+        """
+        url = f"{BASE_URL}?limit={PAGE_LIMIT}&offset={offset}"
+        logger.debug(f"Запит до API: {url}")
+
+        response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+
+    def search_tenders(self) -> List[str]:
+        """
+        Пошук актуальних тендерів за заданими фільтрами.
+
+        Returns:
+            List[str]: список текстових повідомлень про тендери
+        """
         results = []
-        
-        for tenders in tenders_pages:
-            for tender in tenders:
-                tender_id = tender.get('id')
-                if not tender_id:
-                    continue
+        offset = ""
+        pages = 0
 
-                details = self.get_tender_details(tender_id)
-                if not details:
-                    continue
+        try:
+            while pages < MAX_PAGES:
+                data = self._fetch_page(offset)
+                tenders = data.get("data", [])
+                offset = data.get("next_page", {}).get("offset")
+                pages += 1
 
-                # Фільтр по статусу
-                if details.get('status') != "active.tendering":
-                    continue
+                logger.info(f"Отримано {len(tenders)} тендерів зі сторінки {pages}")
 
-                # Фільтр по CPV кодах
-                if not self._matches_cpv(details):
-                    continue
+                for tender in tenders:
+                    tender_id = tender.get("id")
+                    if not tender_id or tender_id in self.seen_tenders:
+                        continue
 
-                # Фільтр по регіону
-                if not self._matches_region(details):
-                    continue
+                    self.seen_tenders.add(tender_id)
 
-                results.append(details)
+                    procuring_entity = tender.get("procuringEntity", {})
+                    address = procuring_entity.get("address", {}).get("region", "")
+                    cpv_code = tender.get("classification", {}).get("id", "")
+
+                    if not self._is_region_allowed(address):
+                        continue
+                    if not self._is_cpv_allowed(cpv_code):
+                        continue
+
+                    tender_info = (
+                        f"📌 *{tender.get('title', 'Без назви')}*\n"
+                        f"🏢 Замовник: {procuring_entity.get('name', 'Невідомо')}\n"
+                        f"📍 Регіон: {address}\n"
+                        f"🆔 ID: {tender.get('tenderID')}\n"
+                        f"💰 Бюджет: {tender.get('value', {}).get('amount', 'Невідомо')} "
+                        f"{tender.get('value', {}).get('currency', '')}\n"
+                        f"🔗 [Деталі](https://prozorro.gov.ua/tender/{tender_id})"
+                    )
+                    results.append(tender_info)
+
+                if not offset:  # Якщо більше немає сторінок
+                    break
+
                 time.sleep(REQUEST_DELAY)
 
+        except requests.RequestException as e:
+            logger.error(f"Помилка мережі при запиті до ProZorro API: {e}")
+        except Exception as e:
+            logger.exception(f"Несподівана помилка при пошуку тендерів: {e}")
+
         return results
-    
-    def _matches_cpv(self, details: Dict) -> bool:
-        """Перевірка відповідності CPV кодів"""
-        items = details.get('items', []) or []
-        raw_cpvs = list({
-            (item.get('classification', {}) or {}).get('id', '') 
-            for item in items if item.get('classification')
-        })
-        item_cpvs = [cpv.split('-')[0] if isinstance(cpv, str) else '' for cpv in raw_cpvs]
-        return any((cpv or '').startswith(code) for cpv in item_cpvs for code in CPV_CODES)
-    
-    def _matches_region(self, details: Dict) -> bool:
-        """Перевірка відповідності регіону"""
-        procuring_entity = details.get('procuringEntity', {}) or {}
-        region = (procuring_entity.get('address', {}) or {}).get('region', '')
-        return (
-            region in ALLOWED_REGIONS or 
-            any(kw in region for kw in ALLOWED_REGION_KEYWORDS)
-        )
-    
-    def format_tender_message(self, details: Dict) -> str:
-        """Форматування повідомлення про тендер"""
-        items = details.get('items', []) or []
-        raw_cpvs = list({
-            (item.get('classification', {}) or {}).get('id', '') 
-            for item in items if item.get('classification')
-        })
-        item_cpvs = [cpv.split('-')[0] if isinstance(cpv, str) else '' for cpv in raw_cpvs]
-
-        tender_period = details.get('tenderPeriod', {}) or {}
-        deadline_str = tender_period.get('endDate', None)
-        if deadline_str:
-            try:
-                deadline = datetime.fromisoformat(
-                    deadline_str.replace("Z", "+00:00")
-                ).strftime("%d.%m.%Y %H:%M")
-            except Exception:
-                deadline = deadline_str
-        else:
-            deadline = "Немає дедлайну"
-
-        procuring_entity = details.get('procuringEntity', {}) or {}
-        edrpou = (procuring_entity.get('identifier', {}) or {}).get('id', 'Немає ЄДРПОУ')
-        tender_url = f"https://prozorro.gov.ua/tender/{details.get('id')}"
-
-        message = (
-            f"📌 Новий тендер!\n"
-            f"🆔 ID тендера: {details.get('id')}\n"
-            f"📋 Предмет закупівлі: {details.get('title', 'Немає назви')}\n"
-            f"🏷️ CPV Код: {', '.join(item_cpvs)}\n"
-            f"📊 Статус: {details.get('status', 'Немає статусу')}\n"
-            f"⏰ Дедлайн: {deadline}\n"
-            f"🏢 Замовник: {procuring_entity.get('name', 'Немає замовника')}\n"
-            f"🆔 ЄДРПОУ: {edrpou}\n"
-            f"💰 Сума: {details.get('value', {}).get('amount', 'немає бюджету')} "
-            f"{details.get('value', {}).get('currency', '')}\n"
-            f"🔗 Посилання: {tender_url}"
-        )
-        return message
-    
-    def search_tenders(self) -> List[str]:
-        """Основна функція пошуку тендерів"""
-        tenders_pages = self.fetch_tenders_with_pagination()
-        filtered_tenders = self.filter_tenders(tenders_pages)
-        
-        messages = []
-        for tender in filtered_tenders:
-            messages.append(self.format_tender_message(tender))
-        
-        return messages
