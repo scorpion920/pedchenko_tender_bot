@@ -1,7 +1,10 @@
 import logging
-import time
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 from tender_api import ProZorroAPI
 from config import TELEGRAM_TOKEN, CHAT_ID, CHECK_INTERVAL
 
@@ -14,115 +17,68 @@ logger = logging.getLogger(__name__)
 
 api = ProZorroAPI()
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник команди /start."""
+    await update.message.reply_text("👋 Привіт! Це бот моніторингу тендерів ProZorro.")
 
-def start(update: Update, context: CallbackContext) -> None:
-    """
-    Обробник команди /start.
-    Відправляє вітальне повідомлення користувачу.
-
-    Args:
-        update (Update): Об'єкт Telegram Update.
-        context (CallbackContext): Контекст виконання.
-    """
-    update.message.reply_text("👋 Привіт! Це бот моніторингу тендерів ProZorro.")
-
-
-def help_command(update: Update, context: CallbackContext) -> None:
-    """
-    Обробник команди /help.
-    Пояснює доступні команди.
-
-    Args:
-        update (Update): Об'єкт Telegram Update.
-        context (CallbackContext): Контекст виконання.
-    """
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник команди /help."""
     help_text = (
         "📖 Доступні команди:\n"
         "/start - початок роботи\n"
         "/help - довідка\n"
         "/tenders - отримати список нових тендерів"
     )
-    update.message.reply_text(help_text)
+    await update.message.reply_text(help_text)
 
-
-def tenders(update: Update, context: CallbackContext) -> None:
-    """
-    Обробник команди /tenders.
-    Виконує пошук нових тендерів і надсилає користувачу.
-
-    Args:
-        update (Update): Об'єкт Telegram Update.
-        context (CallbackContext): Контекст виконання.
-    """
+async def tenders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник команди /tenders."""
     try:
         results = api.search_tenders()
 
         if not results:
-            update.message.reply_text("Немає нових тендерів.")
+            await update.message.reply_text("Немає нових тендерів.")
             return
 
         for tender in results[:5]:  # обмежимо вивід для зручності
-            message = (
-                f"📌 {tender['title']}\n"
-                f"ID: {tender['tenderID']}\n"
-                f"Статус: {tender['status']}\n"
-                f"Регіон: {tender['region']}\n"
-                f"Дата: {tender['dateModified']}\n"
-                f"https://prozorro.gov.ua/tender/{tender['id']}"
+            await update.message.reply_text(
+                tender,
+                parse_mode="Markdown"
             )
-            update.message.reply_text(message)
 
     except Exception as e:
         logger.error(f"Помилка у команді /tenders: {e}")
-        update.message.reply_text("⚠️ Сталася помилка при отриманні тендерів.")
+        await update.message.reply_text("⚠️ Сталася помилка при отриманні тендерів.")
 
-
-def auto_check(context: CallbackContext) -> None:
-    """
-    Функція для автоматичної перевірки нових тендерів.
-    Виконується за розкладом кожні N секунд.
-
-    Args:
-        context (CallbackContext): Контекст виконання.
-    """
+async def auto_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Функція для автоматичної перевірки нових тендерів."""
     try:
         results = api.search_tenders()
 
         for tender in results:
-            message = (
-                f"📌 {tender['title']}\n"
-                f"ID: {tender['tenderID']}\n"
-                f"Статус: {tender['status']}\n"
-                f"Регіон: {tender['region']}\n"
-                f"Дата: {tender['dateModified']}\n"
-                f"https://prozorro.gov.ua/tender/{tender['id']}"
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=tender,
+                parse_mode="Markdown"
             )
-            context.bot.send_message(chat_id=CHAT_ID, text=message)
 
     except Exception as e:
         logger.error(f"Помилка авто-перевірки: {e}")
 
-
 def main() -> None:
-    """
-    Головна функція запуску Telegram-бота.
-    """
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
+    """Головна функція запуску Telegram-бота."""
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Реєстрація команд
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(CommandHandler("tenders", tenders))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("tenders", tenders))
 
     # Запуск автоматичної перевірки кожні N секунд
-    job_queue = updater.job_queue
-    job_queue.run_repeating(auto_check, interval=CHECK_INTERVAL, first=10)
+    application.job_queue.run_repeating(auto_check, interval=CHECK_INTERVAL, first=10)
 
     logger.info("🚀 Бот запущено!")
-    updater.start_polling()
-    updater.idle()
-
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
